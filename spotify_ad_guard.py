@@ -21,6 +21,7 @@ import json
 import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -36,7 +37,9 @@ import comtypes
 import customtkinter as ctk
 import psutil
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageTk
-from pycaw.pycaw import AudioUtilities, IAudioMeterInformation, ISimpleAudioVolume
+from pycaw.constants import DEVICE_STATE, EDataFlow
+from pycaw.pycaw import (AudioUtilities, IAudioMeterInformation, IAudioSessionControl2,
+                         ISimpleAudioVolume)
 
 try:  # optional: Windows' media controls (album art, exact play/pause, targeted buttons)
     import asyncio
@@ -51,29 +54,33 @@ user32 = ctypes.windll.user32
 user32.IsIconic.argtypes = [wintypes.HWND]
 user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 APP_ID = "AdGuard.SpotifyAdGuard.1"
 RESAMPLE = Image.Resampling
 
 # ---------- Detection settings ----------
 
-AD_TITLES = {"Advertisement", "Spotify", "Spotify Free", "Spotify Premium"}
 IGNORE_TITLES = {"Chrome Legacy Window", "Default IME", "MSCTFIME UI", "GDI+ Window"}
 
-POLL_SECONDS = 0.1      # how often to check for an ad (lower = faster reaction)
-AD_CONFIRM_SURE = 0.25  # seconds an 'Advertisement' title (with sound) must last before restarting
-AD_CONFIRM_MAYBE = 1.5  # same for generic titles ('Spotify Free'...) that also mean 'paused'
-MUTE_CONFIRM_SURE = 0.1  # muting is harmless if wrong, so it reacts faster than a restart
-MUTE_CONFIRM_MAYBE = 0.7
+POLL_SECONDS = 0.05     # how often to check for an ad (lower = faster reaction)
+AD_CONFIRM_SURE = 0.1   # seconds a certain ad (with sound) must last before restarting
+AD_CONFIRM_MAYBE = 0.8  # same for generic titles ('Spotify Free'...) that also mean 'paused'
+MUTE_CONFIRM_SURE = 0.0  # muting is harmless if wrong, so it reacts faster than a restart
+MUTE_CONFIRM_MAYBE = 0.35
 MUTE_END_CONFIRM = 0.15  # a song title must last this long before the sound comes back
 MUTE_MAX_HOLD = 180.0   # never keep Spotify muted longer than this (safety net)
 AD_ESTIMATE = 30        # seconds an ad is assumed to last when a restart skips it
-MEDIA_POLL = 0.4        # how often the Windows media session is read
+MEDIA_POLL = 0.2        # how often the Windows media session is read
+MEDIA_FRESH = 1.5       # a media-session reading older than this is ignored by the watcher
 LOOP_LIMIT = 6          # this many restarts within LOOP_WINDOW seconds means something is wrong
 LOOP_WINDOW = 60.0
 LOOP_BACKOFF = 30.0     # then leave Spotify alone for this long
-PAUSE_GRACE = 2.0       # after a click / Space / Play-Pause, a generic title is not an ad
+PAUSE_GRACE = 1.5       # after you click in Spotify / press Play-Pause, a generic title is not an ad
 SOUND_THRESHOLD = 0.001 # quieter than this counts as silence
+SOUND_GAP = 0.7         # an ad may go quiet this long (between words) without being forgotten
+SOUND_FRESH = 0.3       # a generic title needs sound this recently to confirm (pauses fade out)
+SUSTAINED = 1.0         # sound this long overrides 'paused' signals (they lag behind)
+SILENT_RESCAN = 0.4     # while an ad looks likely but nothing is heard, re-scan audio this often
 RELAUNCH_WAIT = 0.2     # extra pause after the Spotify window appears
 AUTOPLAY_CHECK = 2.0    # seconds to wait for Spotify to resume by itself
 COOLDOWN = 2.0          # pause after a restart before watching again
@@ -813,6 +820,8 @@ class SpotifyProbe:
         self.sessions = []  # (meter, volume) pairs for Spotify's audio sessions
         self.sessions_at = 0.0
         self.fast_until = 0.0  # re-scan the audio sessions often until this time
+        self.mgrs = None       # audio session managers, one per output device
+        self.mgrs_at = 0.0
 
     def reset(self):
         """Forget everything (call after killing or launching Spotify)."""
@@ -820,6 +829,7 @@ class SpotifyProbe:
         self.pids_at = 0.0
         self.sessions = []
         self.sessions_at = 0.0
+        self.mgrs = None
 
     def get_pids(self, max_age=None):
         now = time.time()
@@ -831,25 +841,40 @@ class SpotifyProbe:
         return self.pids
 
     def titles(self):
+        """Titles of Spotify's windows. The main window (a 'Chrome_WidgetWin' window) is read
+        even while hidden, so ads are still caught when Spotify is closed to the tray."""
         pids = self.get_pids()
         found = []
         if not pids:
             return found
+        cls = ctypes.create_unicode_buffer(64)
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         def enum(hwnd, _):
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value in pids and user32.IsWindowVisible(hwnd):
+            if pid.value in pids:
                 n = user32.GetWindowTextLengthW(hwnd)
                 if n:
-                    buf = ctypes.create_unicode_buffer(n + 1)
-                    user32.GetWindowTextW(hwnd, buf, n + 1)
-                    found.append(buf.value)
+                    user32.GetClassNameW(hwnd, cls, 64)
+                    if user32.IsWindowVisible(hwnd) or cls.value.startswith("Chrome_WidgetWin"):
+                        buf = ctypes.create_unicode_buffer(n + 1)
+                        user32.GetWindowTextW(hwnd, buf, n + 1)
+                        if buf.value and buf.value not in IGNORE_TITLES:
+                            found.append(buf.value)
             return True
 
         user32.EnumWindows(enum, 0)
         return found
+
+    def focused(self):
+        """True if a Spotify window has the keyboard focus."""
+        try:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+            return pid.value in self.pids
+        except Exception:
+            return False
 
     def windows(self, max_age=None):
         """Every top-level window owned by Spotify: (hwnd, visible, minimized, title)."""
@@ -898,12 +923,55 @@ class SpotifyProbe:
         return count
 
     def _find_sessions(self):
+        """Spotify's audio sessions on every active output device, not just the default one
+        (headphones, or a per-app output chosen in Windows' sound settings)."""
+        pids = self.get_pids(max_age=1.0)
         found = []
-        for s in AudioUtilities.GetAllSessions():
-            if s.Process and s.Process.name() == "Spotify.exe":
-                found.append((s._ctl.QueryInterface(IAudioMeterInformation),
-                              s._ctl.QueryInterface(ISimpleAudioVolume)))
+        if not pids:
+            return found
+        for mgr in self._managers():
+            try:
+                en = mgr.GetSessionEnumerator()
+                for i in range(en.GetCount()):
+                    ctl = en.GetSession(i)
+                    if ctl is None:
+                        continue
+                    ctl2 = ctl.QueryInterface(IAudioSessionControl2)
+                    if ctl2.GetProcessId() in pids:
+                        found.append((ctl2.QueryInterface(IAudioMeterInformation),
+                                      ctl2.QueryInterface(ISimpleAudioVolume)))
+            except Exception:
+                continue
         return found
+
+    def _managers(self):
+        """Session managers of the active output devices (the list itself rarely changes,
+        so it is only rebuilt every few seconds)."""
+        now = time.time()
+        if self.mgrs is None or now - self.mgrs_at > 10.0:
+            self.mgrs_at = now
+            managers = []
+            try:
+                for d in AudioUtilities.GetAllDevices(EDataFlow.eRender.value,
+                                                      DEVICE_STATE.ACTIVE.value):
+                    try:
+                        if d.AudioSessionManager is not None:
+                            managers.append(d.AudioSessionManager)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if not managers:  # fall back to the default device
+                try:
+                    managers = [AudioUtilities.GetAudioSessionManager()]
+                except Exception:
+                    managers = []
+            self.mgrs = [m for m in managers if m is not None]
+        return self.mgrs
+
+    def rescan(self):
+        """Look at the audio sessions again on the next read (a new one may have appeared)."""
+        self.sessions_at = 0.0
 
     def _refresh(self):
         now = time.time()
@@ -987,18 +1055,24 @@ class SpotifyProbe:
 VK_LBUTTON, VK_CONTROL, VK_UP, VK_DOWN = 0x01, 0x11, 0x26, 0x28
 VK_VOLUME_MUTE, VK_VOLUME_DOWN, VK_VOLUME_UP = 0xAD, 0xAE, 0xAF
 VK_SPACE, VK_MEDIA_PLAY_PAUSE = 0x20, 0xB3
+VK_MEDIA_NEXT, VK_MEDIA_PREV, VK_MEDIA_STOP = 0xB0, 0xB1, 0xB2
 
 
 class UserInput:
     """Remembers when the user last used a way of changing the volume (mouse button,
-    volume keys, Ctrl+Up/Down) and a way of pausing (mouse button, Space, Play/Pause).
+    volume keys, Ctrl+Up/Down) and a way of pausing Spotify (a click or Space inside
+    Spotify, or a media key anywhere).
+
+    Clicks in other apps are ignored for pausing: counting every click on the PC kept
+    postponing ad detection for people who were busy doing something else.
 
     Windows only lets the "pressed since last check" bit of a key be read once, so
     everything shares this one sampler instead of reading the keys separately."""
 
-    def __init__(self):
+    def __init__(self, spotify_focused=None):
         self.last_volume = 0.0
         self.last_pause = 0.0
+        self.spotify_focused = spotify_focused or (lambda: False)
 
     def poll(self):
         now = time.time()
@@ -1009,10 +1083,13 @@ class UserInput:
         try:
             mouse = hit(VK_LBUTTON)
             ctrl = hit(VK_CONTROL)
+            space = hit(VK_SPACE)
             if (mouse or hit(VK_VOLUME_UP) or hit(VK_VOLUME_DOWN) or hit(VK_VOLUME_MUTE)
                     or (ctrl and (hit(VK_UP) or hit(VK_DOWN)))):
                 self.last_volume = now
-            if mouse or hit(VK_SPACE) or hit(VK_MEDIA_PLAY_PAUSE):
+            media_key = (hit(VK_MEDIA_PLAY_PAUSE) or hit(VK_MEDIA_NEXT) or hit(VK_MEDIA_PREV)
+                         or hit(VK_MEDIA_STOP))
+            if media_key or ((mouse or space) and self.spotify_focused()):
                 self.last_pause = now
         except Exception:
             pass
@@ -1098,35 +1175,67 @@ class VolumeKeeper:
                     self.log(f"Volume put back to {round(self.good[0] * 100)}%")
 
 
-def looks_like_ad(title):
-    """Tracks show as 'Artist - Song'. Anything else is not a track."""
-    if title in IGNORE_TITLES:
-        return False
-    return title in AD_TITLES or " - " not in title
+# What Spotify calls an ad, in the languages its desktop app ships in. The window title (or
+# the media session's title) is exactly one of these while an ad plays.
+AD_WORDS = {
+    "advertisement", "advertising", "ad", "ads", "sponsored", "spotify ad",
+    "werbung", "anzeige", "publicité", "publicite", "annonce", "pub",
+    "anuncio", "publicidad", "anúncio", "anuncio publicitário", "publicidade",
+    "pubblicità", "pubblicita", "annuncio", "advertentie", "reclame", "annons",
+    "reklam", "reklame", "annonse", "mainos", "auglýsing", "reklama", "reklamë",
+    "hirdetés", "reclamă", "reclama", "oglas", "oglasi", "reklaam", "reklāma",
+    "διαφήμιση", "реклама", "оголошення",
+    "広告", "광고", "广告", "廣告", "إعلان", "اعلان", "פרסומת", "تبلیغ", "تبليغ",
+    "iklan", "quảng cáo", "โฆษณา", "विज्ञापन", "বিজ্ঞাপন", "விளம்பரம்", "ప్రకటన",
+    "जाहिरात", "જાહેરાત", "ಜಾಹೀರಾತು", "പരസ്യം", "ਇਸ਼ਤਿਹਾਰ", "اشتہار",
+    "patalastas", "matangazo", "tangazo", "hysbyseb", "fógra",
+}
+# Shown both while paused and during some ads, so on their own they prove nothing.
+GENERIC_TITLES = {"spotify", "spotify free", "spotify premium"}
+TRACK_SEP = re.compile(r"\s[-–—]\s")  # 'Artist - Song' (some builds use an en or em dash)
 
 
-def is_track_title(title):
-    return title not in IGNORE_TITLES and not looks_like_ad(title)
-
-
-def is_sure_ad(title):
-    """Spotify's own label for an ad. Titles that merely aren't a track ('Spotify Free',
-    'Spotify'...) are what a paused Spotify shows too, so they are not proof."""
-    return title.strip().lower().startswith("advertisement")
-
-
-def is_ad_title(title):
-    """For titles from the media session, which hold only the song name (no 'Artist - ')."""
-    t = title.strip()
-    return t in AD_TITLES or t.lower().startswith("advertisement")
+def _norm(title):
+    return " ".join((title or "").replace("‎", "").replace("‏", "").split()).lower()
 
 
 def parse_track(title):
     """'Artist - Song' -> (song, artist)."""
-    if " - " in title:
-        artist, song = title.split(" - ", 1)
-        return song.strip(), artist.strip()
-    return title.strip(), ""
+    parts = TRACK_SEP.split(title or "", 1)
+    if len(parts) == 2:
+        return parts[1].strip(), parts[0].strip()
+    return (title or "").strip(), ""
+
+
+def looks_like_ad(title):
+    """Tracks show as 'Artist - Song'. Anything else is not a track."""
+    if not title or title in IGNORE_TITLES:
+        return False
+    return is_sure_ad(title) or _norm(title) in GENERIC_TITLES or not TRACK_SEP.search(title)
+
+
+def is_track_title(title):
+    return bool(title) and title not in IGNORE_TITLES and not looks_like_ad(title)
+
+
+def is_sure_ad(title):
+    """Spotify's own label for an ad, in any language ('Advertisement', 'Werbung', '広告'...),
+    or a track credited to Spotify itself (its own promos). Generic titles ('Spotify Free')
+    are what a paused Spotify shows too, so they are not proof."""
+    t = _norm(title)
+    if not t:
+        return False
+    if t in AD_WORDS or t.startswith("advertisement"):
+        return True
+    song, artist = parse_track(t)
+    return bool(artist) and (artist in ("spotify", "advertisement") or song in AD_WORDS
+                             and artist in GENERIC_TITLES)
+
+
+def is_ad_title(title):
+    """For titles from the media session, which hold only the song name (no 'Artist - ')."""
+    t = _norm(title)
+    return t in AD_WORDS or t in GENERIC_TITLES or t.startswith("advertisement")
 
 
 def stamp():
@@ -1267,6 +1376,7 @@ class MediaSession(threading.Thread):
         self._key = None
         self._track_id = 0
         self._art = None
+        self.last_command = 0.0
 
     @property
     def ready(self):
@@ -1308,7 +1418,18 @@ class MediaSession(threading.Thread):
             self.info = dict(EMPTY_MEDIA)
             return
         props = await spotify.try_get_media_properties_async()
-        status = self.STATUS.get(int(spotify.get_playback_info().playback_status), "other")
+        pinfo = spotify.get_playback_info()
+        status = self.STATUS.get(int(pinfo.playback_status), "other")
+        next_ok = seek_ok = None  # None = unknown
+        try:
+            next_ok = bool(pinfo.controls.is_next_enabled)
+            seek_ok = bool(pinfo.controls.is_playback_position_enabled)
+        except Exception:
+            pass
+        try:
+            track_no = int(props.track_number or 0)
+        except Exception:
+            track_no = 0
         pos = dur = 0.0
         try:
             tl = spotify.get_timeline_properties()
@@ -1329,7 +1450,8 @@ class MediaSession(threading.Thread):
             self._art = None
         info = {"ok": True, "title": props.title or "", "artist": props.artist or "",
                 "album": props.album_title or "", "status": status, "pos": pos, "dur": dur,
-                "at": time.monotonic(), "art": self._art, "track_id": self._track_id}
+                "at": time.monotonic(), "art": self._art, "track_id": self._track_id,
+                "next_ok": next_ok, "seek_ok": seek_ok, "track_no": track_no}
         self.info = info
         if self._art is None and props.thumbnail is not None and info["title"]:
             art = await self._read_art(props.thumbnail)
@@ -1358,6 +1480,7 @@ class MediaSession(threading.Thread):
 
     def command(self, name, timeout=1.5):
         """'next' / 'prev' / 'play' / 'pause' / 'toggle'. True if Spotify accepted it."""
+        self.last_command = time.time()  # a pause you asked for is not an ad starting
         if not self.ready:
             return False
 
@@ -1476,6 +1599,116 @@ class NowPlaying(threading.Thread):
         return False
 
 
+# ---------- Ad detection ----------
+
+def media_ad_level(mi):
+    """How ad-like Windows' media session looks: 0 = music, 1 = could be an ad,
+    2 = certainly an ad. Language-independent: during an ad Spotify turns off Next and
+    seeking, and an ad has no album."""
+    if not mi or not mi.get("ok") or mi.get("status") != "playing":
+        return 0
+    title, artist = _norm(mi.get("title")), _norm(mi.get("artist"))
+    album = (mi.get("album") or "").strip()
+    locked = mi.get("next_ok") is False and mi.get("seek_ok") is False
+    named = title in AD_WORDS or title.startswith("advertisement")
+    if not album and (named or locked or artist == "spotify"):
+        return 2
+    if locked or named:
+        return 1
+    if not album and not mi.get("track_no") and (not artist or title in GENERIC_TITLES):
+        return 1
+    return 0
+
+
+def _media_reason(mi):
+    if mi.get("next_ok") is False and mi.get("seek_ok") is False:
+        return "skipping and seeking locked"
+    return f'media "{mi.get("title") or "untitled"}"'
+
+
+def _same_song(track_title, mi):
+    song, _ = parse_track(track_title)
+    t = _norm(mi.get("title"))
+    return bool(t) and (t == _norm(song) or t in _norm(track_title))
+
+
+class AdDetector:
+    """Decides from one snapshot at a time whether an ad is playing. It has no side effects,
+    so the rules can be tested on their own.
+
+    'sure'  : Spotify's ad label in any language, a Spotify promo, or the media session
+              showing an ad (skipping and seeking locked, no album). Acted on at once.
+    'maybe' : a generic title ('Spotify Free') with sound. A paused Spotify shows the same
+              title, so it needs a moment of steady sound, and is ignored right after you
+              paused, unless the sound keeps going (then it is not a pause)."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.since = None         # when the current ad-looking stretch began (with sound)
+        self.seen = None          # when it first looked like an ad (sound or not)
+        self.sure = False
+        self.reason = ""
+        self.silent = False       # looks like an ad but nothing is heard yet
+        self.last_sound = -1e9
+        self.sound_since = None
+
+    def update(self, now, titles, sound, mi, last_pause):
+        """titles: Spotify's window titles. sound: Spotify is audible right now (None if its
+        audio can't be found). mi: a fresh media-session reading or None. last_pause: when
+        you last might have paused Spotify. Returns 'sure', 'maybe' or None."""
+        if sound is None:  # can't hear Spotify (unusual audio setup): trust the media session
+            sound = bool(mi and mi.get("status") == "playing")
+        if sound:
+            self.last_sound = now
+            if self.sound_since is None:
+                self.sound_since = now
+        elif self.sound_since is not None and now - self.last_sound > SOUND_GAP:
+            self.sound_since = None  # a real silence, not a gap between words
+        heard = self.sound_since is not None
+        sustained = now - self.sound_since if heard else 0.0
+
+        track = next((t for t in titles if is_track_title(t)), None)
+        named = next((t for t in titles if is_sure_ad(t)), None)
+        generic = next((t for t in titles if looks_like_ad(t)), None)
+        level = media_ad_level(mi)
+
+        reason, sure = None, False
+        if named:
+            reason, sure = f'title "{named}"', True
+        elif level == 2 and (not track or not _same_song(track, mi)):
+            reason, sure = _media_reason(mi), True
+        elif not track and (generic or level == 1):
+            reason = f'title "{generic}"' if generic else _media_reason(mi)
+
+        if reason and not sure:
+            paused = bool(mi and mi.get("status") in ("paused", "stopped"))
+            if (paused or now - last_pause < PAUSE_GRACE) and sustained < SUSTAINED:
+                reason = None  # you (probably) just paused; the sound is only fading out
+        if reason is None:
+            self.since = self.seen = None
+            self.sure, self.reason, self.silent = False, "", False
+            return None
+        if self.seen is None:
+            self.seen = now
+        self.silent = not heard
+        if not heard:
+            self.since = None
+            return None
+        if self.since is None:
+            self.since = now
+        self.sure, self.reason = sure, reason
+        return "sure" if sure else "maybe"
+
+    def confirmed(self, now, need_sure, need_maybe):
+        if self.since is None:
+            return False
+        if self.sure:
+            return now - self.since >= need_sure
+        return now - self.since >= need_maybe and now - self.last_sound <= SOUND_FRESH
+
+
 # ---------- Worker thread ----------
 
 class Watcher(threading.Thread):
@@ -1492,7 +1725,9 @@ class Watcher(threading.Thread):
         self._state = None
         self.probe = self.keeper = self.inputs = None
         self.hold = None              # set while an ad is muted
-        self.ad_since = None          # when the current ad-looking stretch began
+        self.detector = AdDetector()
+        self.last_titles = None
+        self.rescan_at = 0.0
         self.cooldown_until = 0.0
         self.backoff_until = 0.0
         self.quiet_until = 0.0        # keep Spotify minimized until then (quiet restarts)
@@ -1546,7 +1781,7 @@ class Watcher(threading.Thread):
 
     def fresh_media(self):
         mi = getattr(self.media, "info", None) if self.media is not None else None
-        if mi and mi.get("ok") and time.monotonic() - mi.get("at", 0.0) < 3.0:
+        if mi and mi.get("ok") and time.monotonic() - mi.get("at", 0.0) < MEDIA_FRESH:
             return mi
         return None
 
@@ -1615,7 +1850,7 @@ class Watcher(threading.Thread):
         if forced:
             self.log("Skipping the ad you picked, restarting Spotify", "warn")
         else:
-            self.log(f'Ad detected ("{title}"), restarting Spotify', "warn")
+            self.log(f"Ad detected ({title}), restarting Spotify", "warn")
         self.status("restarting")
         self.publish(True, "restarting")
         keeper.tick()  # grab the volume as it is right now
@@ -1641,7 +1876,7 @@ class Watcher(threading.Thread):
         now = time.time()
         self.cooldown_until = now + COOLDOWN
         self.last_key = None
-        self.ad_since = None
+        self.detector.reset()
         # Many restarts in a row means something is misreading Spotify: stop and say so.
         self.restarts = [t for t in self.restarts if now - t < LOOP_WINDOW] + [now]
         if len(self.restarts) >= LOOP_LIMIT:
@@ -1668,7 +1903,7 @@ class Watcher(threading.Thread):
         if not prev:
             self.cfg["muted_by_us"] = True
             save_settings(self.cfg)
-        self.log(f'Ad detected ("{title}"), muted until it ends', "warn")
+        self.log(f"Ad detected ({title}), muted until it ends", "warn")
         self.q.put(("ad", clock(), "mute"))
         self.status("muted")
         self.publish(True, "muted")
@@ -1691,7 +1926,7 @@ class Watcher(threading.Thread):
             song = any(is_track_title(t) for t in titles)
         else:  # window hidden: ask the media session
             song = bool(mi and mi.get("title") and not is_ad_title(mi["title"])
-                        and mi.get("status") == "playing")
+                        and mi.get("status") == "playing" and media_ad_level(mi) == 0)
         if song:
             if h["end"] is None:
                 h["end"] = now
@@ -1764,7 +1999,7 @@ class Watcher(threading.Thread):
 
     def loop_forever(self):
         self.probe = SpotifyProbe()
-        self.inputs = UserInput()
+        self.inputs = UserInput(self.probe.focused)
         self.keeper = VolumeKeeper(self.probe, self.log, self.dbg, self.inputs)
         self.log("Protection started", "ok")
         while not self.stop_event.is_set():
@@ -1783,7 +2018,7 @@ class Watcher(threading.Thread):
         self.log("Protection stopped")
 
     def step(self):
-        probe, keeper, inputs = self.probe, self.keeper, self.inputs
+        probe, keeper, inputs, det = self.probe, self.keeper, self.inputs, self.detector
         now = time.time()
         titles = probe.titles()
         mi = self.fresh_media()
@@ -1794,48 +2029,43 @@ class Watcher(threading.Thread):
             self.hold_step(titles, mi, now)
             return
 
+        # A changed title often means a new audio stream (ads can play on their own one):
+        # look for it now instead of on the next routine scan.
+        if titles != self.last_titles:
+            self.last_titles = titles
+            probe.rescan()
+        elif det.silent and now - self.rescan_at > SILENT_RESCAN:
+            self.rescan_at = now
+            probe.rescan()
+
         sound = probe.making_sound(self.dbg)
+        if not probe.sessions:
+            sound = None  # Spotify's audio can't be found; the detector falls back on media
         keeper.tick()  # learns your volume, fixes start-up resets
         self.status("watching" if probe.pids else "waiting")
-
-        key = (tuple(titles), sound, mi.get("status") if mi else None)
-        if key != self.last_key:
-            self.log(f"titles={titles} sound={sound} media={mi.get('status') if mi else None}",
-                     debug=True)
-            self.last_key = key
-
         inputs.poll()
-        # Windows' media session knows for certain when Spotify is paused. A fading sound
-        # and a generic window title otherwise look just like an ad starting.
-        paused = bool(mi and mi.get("status") in ("paused", "stopped"))
-        playing = sound and not paused
-        if titles:
-            sure_src = any(is_sure_ad(t) for t in titles)
-        else:  # window hidden (closed to the tray): the media session still names the ad
-            sure_src = bool(mi and is_sure_ad(mi.get("title", "")))
-        sure = playing and sure_src
-        maybe = sure or (playing and any(looks_like_ad(t) for t in titles))
-        # A generic title only counts once it has lasted a while, and never right after you
-        # clicked, pressed Space or hit Play/Pause.
-        if maybe and not sure and now - inputs.last_pause < PAUSE_GRACE:
-            maybe = False
-        if maybe:
-            if self.ad_since is None:
-                self.ad_since = now
-        else:
-            self.ad_since = None
+        last_pause = max(inputs.last_pause, getattr(self.media, "last_command", 0.0) or 0.0)
+        state = det.update(now, titles, sound, mi, last_pause)
+
+        key = (tuple(titles), sound, mi.get("status") if mi else None, media_ad_level(mi), state)
+        if key != self.last_key:
+            self.last_key = key
+            if mi:
+                extra = (f' media={mi.get("status")} "{mi.get("title")}" album="{mi.get("album")}"'
+                         f' next={mi.get("next_ok")} seek={mi.get("seek_ok")}')
+            else:
+                extra = " media=none"
+            self.log(f"titles={titles} sound={sound}{extra} -> {state or 'no ad'}", debug=True)
 
         mute_mode = self.mode == "mute"
-        need = ((MUTE_CONFIRM_SURE, MUTE_CONFIRM_MAYBE) if mute_mode
-                else (AD_CONFIRM_SURE, AD_CONFIRM_MAYBE))[0 if sure else 1]
-        confirmed = self.ad_since is not None and now - self.ad_since >= need
-        ad_title = next((t for t in titles if looks_like_ad(t)),
-                        (mi or {}).get("title", "") if not titles else "")
+        need = (MUTE_CONFIRM_SURE, MUTE_CONFIRM_MAYBE) if mute_mode else (AD_CONFIRM_SURE,
+                                                                          AD_CONFIRM_MAYBE)
+        confirmed = det.confirmed(now, *need)
 
         forced = self.skip_now.is_set()
         if forced:
             self.skip_now.clear()
-            if self.ad_since is None and not any(looks_like_ad(t) for t in titles):
+            if det.seen is None and not any(looks_like_ad(t) for t in titles):
                 forced = False  # no ad is playing, nothing to skip
         self.publish(confirmed or forced)
 
@@ -1845,15 +2075,16 @@ class Watcher(threading.Thread):
             probe.minimize_visible(0.5)
 
         if forced:
-            self.ad_since = None
-            self.restart(ad_title or "Advertisement", forced=True)
+            det.reset()
+            self.restart("you pressed Skip", forced=True)
         elif confirmed:
+            why = f"{det.reason}, {now - (det.seen or now):.1f}s"
             if mute_mode:
-                self.ad_since = None
-                self.start_mute(ad_title or "Advertisement")
+                det.reset()
+                self.start_mute(why)
             elif now > self.cooldown_until and now > self.backoff_until:
-                self.ad_since = None
-                self.restart(ad_title or "Advertisement")
+                det.reset()
+                self.restart(why)
 
 
 # ---------- GUI ----------
